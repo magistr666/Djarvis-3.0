@@ -1,0 +1,39 @@
+# --- Билды ---
+build/
+dist/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Рантайм-файлы ассистента (создаются при запуске) ---
+jarvis_state.json
+jarvis_speech.json
+заметки.txt
+
+# --- Логи ---
+*.log
+*.log.err
+
+# --- Экспериментальные/тестовые артефакты оболочки ---
+avatar_test*.log
+avatar_test*.log.err
+avatar3d_test.log
+avatar_http.log
+minion.glb
+robot_mesh_data.js
+robot_head_ursula.png
+jarvis_ursula.gd
+GLTFLoader.js
+GLTFLoader_addon.js
+GLTFLoader_js.js
+GLTFLoader_r128.js
+three.module.js
+three_r128.min.js
+
+# --- Секреты ---
+.env
+*.pem

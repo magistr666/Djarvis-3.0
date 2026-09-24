@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Jarvis Avatar 3D</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0f1a; }
+  #stage { width: 100%; height: 100%; }
+  #badge {
+    position: absolute; top: 6px; right: 8px; z-index: 10;
+    font: 11px monospace; color: #9fd8ff; background: rgba(10,20,35,0.7);
+    padding: 2px 8px; border-radius: 4px; border: 1px solid #1d4f75;
+  }
+  #loadmsg {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    color: #5aa7d8; font: 13px monospace; z-index: 5; white-space: pre-wrap;
+    max-width: 90%; text-align: center;
+  }
+</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="badge">idle</div>
+  <div id="loadmsg">Загрузка модели...</div>
+
+  <script src="three147.min.js"></script>
+  <script src="GLTFLoader147.js"></script>
+  <script>
+(function() {
+  var badge = document.getElementById('badge');
+  var loadmsg = document.getElementById('loadmsg');
+  var stage = document.getElementById('stage');
+  var W = stage.clientWidth || 300, H = stage.clientHeight || 540;
+
+  var scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0a0f1a);
+
+  var camera = new THREE.PerspectiveCamera(40, W / H, 0.1, 100);
+  camera.position.set(0, 0.7, 2.6);
+  camera.lookAt(0, 0.6, 0);
+
+  var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setSize(W, H);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.outputEncoding = THREE.sRGBEncoding;
+  stage.appendChild(renderer.domElement);
+
+  var amb = new THREE.AmbientLight(0xd0e4ff, 1.1);
+  scene.add(amb);
+  var dir = new THREE.DirectionalLight(0xffffff, 1.4);
+  dir.position.set(1.5, 2.5, 2);
+  scene.add(dir);
+  var rim = new THREE.DirectionalLight(0x3399ff, 0.5);
+  rim.position.set(-2, 1, -1.5);
+  scene.add(rim);
+
+  // Состояния
+  var currentState = 'idle';
+  function setState(s) {
+    if (!s) return;
+    s = s.toLowerCase();
+    if (['idle', 'speaking', 'multitool'].includes(s)) {
+      currentState = s;
+      badge.textContent = '3d+' + s;
+    }
+  }
+  setInterval(async function() {
+    try {
+      var r = await fetch('state.json?_=' + Date.now(), { cache: 'no-store' });
+      var data = await r.json();
+      if (data && data.state && data.state !== currentState) setState(data.state);
+      if (currentState === 'speaking' && data && data.state === 'speaking') {
+        if ((Date.now() - (data.ts || 0) * 1000) > 6000) setState('idle');
+      }
+    } catch (e) {}
+  }, 400);
+
+  // ====== Загрузка GLB с текстурами через GLTFLoader ======
+  var model = null, mixer = null, animTime = 0;
+  var clips = {};
+  var loader = new THREE.GLTFLoader();
+  loader.load('robot.glb', function(gltf) {
+    model = gltf.scene;
+    scene.add(model);
+
+    // Подсветка глаз: меши с чёрным материалом -> эмиссивный cyan (как в демо three.js)
+    // Материал Main (оранжевый) -> стальной (серо-голубой металлик)
+    model.traverse(function(obj) {
+      if (obj.isMesh && obj.material) {
+        var mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+        for (var mi = 0; mi < mats.length; mi++) {
+          var m = mats[mi];
+          if (m && m.name === 'Black') {
+            m.emissive = new THREE.Color(0x00e5ff);
+            m.emissiveIntensity = 1.4;
+          }
+          if (m && m.name === 'Main') {
+            m.color.setHex(0x8899aa);
+            m.metalness = 0.7;
+            m.roughness = 0.3;
+          }
+          if (m && m.name === 'Grey') {
+            m.color.setHex(0x556677);
+            m.metalness = 0.6;
+            m.roughness = 0.35;
+          }
+        }
+      }
+    });
+
+    // Масштабируем до высоты ~1.6
+    var box = new THREE.Box3().setFromObject(model);
+    var size = box.getSize(new THREE.Vector3());
+    var s = 1.5 / (size.y || 1);
+    model.scale.setScalar(s);
+    var center = box.getCenter(new THREE.Vector3());
+    model.position.y -= center.y * s;
+    model.position.y += 0.8;
+
+    // Собираем клипы по имени
+    mixer = new THREE.AnimationMixer(model);
+    if (gltf.animations && gltf.animations.length) {
+      for (var i = 0; i < gltf.animations.length; i++) {
+        clips[gltf.animations[i].name] = gltf.animations[i];
+      }
+      // стартовый клип
+      var start = clips['Idle'] || clips['Standing'] || gltf.animations[0];
+      if (start) {
+        mixer.clipAction(start).play();
+        currentClip = start;
+      }
+    }
+
+    loadmsg.style.display = 'none';
+    badge.textContent = '3d+idle';
+  }, function(xhr) {
+    if (xhr.total) {
+      loadmsg.textContent = 'Загрузка ' + Math.round(xhr.loaded / xhr.total * 100) + '%';
+    }
+  }, function(err) {
+    loadmsg.textContent = 'Ошибка: ' + (err && err.message ? err.message : err);
+  });
+  var currentClip = null;
+
+  // Переключение анимации по состоянию
+  function playClip(name) {
+    if (!mixer || !clips[name]) { currentClip = null; return; }
+    if (currentClip === clips[name]) return;
+    if (currentClip) mixer.stopAction(mixer.clipAction(currentClip));
+    currentClip = clips[name];
+    mixer.clipAction(currentClip).play();
+  }
+
+  // Ядро
+  var core = new THREE.Mesh(
+    new THREE.SphereGeometry(0.06, 24, 24),
+    new THREE.MeshBasicMaterial({ color: 0x00b3ff, transparent: true, opacity: 0.95 })
+  );
+  core.position.set(0, 0.62, 0.45);
+  scene.add(core);
+  var ring = new THREE.Mesh(
+    new THREE.RingGeometry(0.10, 0.13, 32),
+    new THREE.MeshBasicMaterial({ color: 0x00ccff, transparent: true, opacity: 0.6, side: THREE.DoubleSide })
+  );
+  ring.position.set(0, 0.62, 0.46);
+  scene.add(ring);
+
+  // Параллакс
+  var mouseX = 0, mouseY = 0;
+  window.addEventListener('mousemove', function(e) {
+    mouseX = (e.clientX / window.innerWidth - 0.5) * 2;
+    mouseY = (e.clientY / window.innerHeight - 0.5) * 2;
+  });
+
+  // Анимация
+  function animate() {
+    requestAnimationFrame(animate);
+    animTime += 0.016;
+    var dt = 0.016;
+
+    camera.position.x = mouseX * 0.2;
+    camera.position.y = 0.7 + mouseY * 0.12;
+    camera.lookAt(0, 0.6, 0);
+
+    if (model) {
+      if (mixer) {
+        if (currentState === 'idle') {
+          playClip('Idle');
+          mixer.update(dt);
+          model.rotation.y = Math.sin(animTime * 0.8) * 0.05;
+        } else if (currentState === 'speaking') {
+          playClip('Wave');
+          mixer.update(dt * 1.2);
+          model.rotation.y = Math.sin(animTime * 2.6) * 0.15;
+        } else {
+          playClip('Yes');
+          mixer.update(dt);
+          model.rotation.y = Math.sin(animTime * 1.6) * 0.08;
+        }
+      } else {
+        if (currentState === 'idle') {
+          model.rotation.y = Math.sin(animTime * 0.8) * 0.05;
+        } else if (currentState === 'speaking') {
+          model.rotation.y = Math.sin(animTime * 2.6) * 0.15;
+        } else {
+          model.rotation.y = Math.sin(animTime * 1.6) * 0.08;
+        }
+      }
+    }
+
+    core.visible = ring.visible = (currentState === 'multitool');
+    if (currentState === 'multitool') {
+      var p = 0.85 + Math.sin(animTime * 8) * 0.35;
+      core.scale.setScalar(p);
+      core.material.color.setHex(0x00ccff);
+      ring.material.opacity = 0.4 + Math.sin(animTime * 6) * 0.3;
+      ring.scale.setScalar(1 + Math.sin(animTime * 6) * 0.25);
+    }
+
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  window.addEventListener('resize', function() {
+    var w = stage.clientWidth, h = stage.clientHeight;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h);
+  });
+})();
+</script>
+</body>
+</html>
