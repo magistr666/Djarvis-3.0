@@ -33,10 +33,12 @@ if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
     ASSET_DIR = sys._MEIPASS
     RUNTIME_DIR = os.path.dirname(sys.executable)
     MODEL_DIR = os.path.join(ASSET_DIR, 'vosk-model-small-ru-0.22')
+    SPK_MODEL_DIR = os.path.join(ASSET_DIR, 'vosk-model-spk-0.4')
 else:
     ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
     RUNTIME_DIR = ASSET_DIR
     MODEL_DIR = r"C:\Users\DK_ART\AppData\Local\Temp\gigatool\vosk-model\vosk-model-small-ru-0.22"
+    SPK_MODEL_DIR = r"C:\Users\DK_ART\AppData\Local\Temp\gigatool\vosk-model-spk-0.4"
 SR = 16000
 BLOCK = 4000
 WAKE_WORDS = ("джарвис", "джарвис", "jarvis", "жарвис", "джарвис ай",
@@ -109,13 +111,114 @@ def on_quit_cue():
 class JarvisBridge:
     def __init__(self):
         self.model = Model(MODEL_DIR)
-        self.rec = KaldiRecognizer(self.model, SR)
+        # Распознавание говорящего (spk). Модель опциональна — если её нет,
+        # ассистент работает без идентификации (graceful degradation).
+        self.spk = None
+        spk_exist = os.path.isdir(SPK_MODEL_DIR)
+        if spk_exist:
+            try:
+                self.spk = SpkModel(SPK_MODEL_DIR)
+                log("[spk] модель говорящего загружена")
+            except Exception as e:
+                self.spk = None
+                log(f"[spk] ошибка загрузки модели: {e}")
+        else:
+            log("[spk] модель говорящего не найдена, идентификация отключена")
+        if self.spk is not None:
+            self.rec = KaldiRecognizer(self.model, SR, self.spk)
+        else:
+            self.rec = KaldiRecognizer(self.model, SR)
         self.rec.SetWords(True)
         self.audio_q = queue.Queue()
         self.wake_detected = False
         self.speaking_lock = False
         self.wake_lock_until = 0.0
         self.capture_dev = None
+        self.last_spk = None          # эмбеддинг голоса последней фразы
+        self.speakers = self._load_speakers()
+
+    # ---------- распознавание говорящего ----------
+    @staticmethod
+    def _extract_spk(result_json) -> list:
+        try:
+            v = result_json.get("spk")
+            return list(v) if v else []
+        except Exception:
+            return []
+
+    def _load_speakers(self) -> dict:
+        path = os.path.join(RUNTIME_DIR, "speakers.json")
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            log(f"[spk] load speakers error: {e}")
+        return {}
+
+    def _save_speakers(self):
+        path = os.path.join(RUNTIME_DIR, "speakers.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.speakers, f, ensure_ascii=False)
+        except Exception as e:
+            log(f"[spk] save speakers error: {e}")
+
+    @staticmethod
+    def _cosine(a: list, b: list) -> float:
+        if not a or not b or len(a) != len(b):
+            return 0.0
+        import math
+        ab = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(y * y for y in b))
+        if na == 0 or nb == 0:
+            return 0.0
+        return ab / (na * nb)
+
+    def identify_speaker(self) -> str:
+        """Возвращает имя говорящего или '' если не распознан / недостаточно данных."""
+        if not self.spk or not self.last_spk:
+            return ""
+        best_name, best_cos, threshold = "", 0.0, 0.55
+        for name, vec in self.speakers.items():
+            if len(vec) != len(self.last_spk):
+                continue
+            c = self._cosine(self.last_spk, vec)
+            if c > best_cos:
+                best_cos, best_name = c, name
+        return best_name if best_cos >= threshold else ""
+
+    def _announce_speaker(self):
+        name = self.identify_speaker()
+        if name:
+            self._say(f"Говорит, {name}")
+            return True
+        return False
+
+    def _register_voice(self, text: str) -> bool:
+        m = re.search(r"(?:как|это|зовут|имя|меня зовут)\s+([а-яё]+)", text, re.I)
+        if m:
+            name = m.group(1).capitalize()
+        else:
+            words = re.findall(r"[а-яё]+", text.lower())
+            known = {"запомни", "голос", "это", "меня", "зовут", "как", "имя", "джарвис"}
+            cand = [w for w in words if w not in known]
+            name = cand[-1].capitalize() if cand else ""
+        if not name:
+            self._say("Как назвать этот голос? Скажите: запомни голос как Алёна")
+            return True
+        if self.spk is None:
+            self._say("Распознавание голоса отключено — модель говорящего не найдена")
+            return True
+        if not self.last_spk:
+            self._say("Не удалось снять отпечаток голоса из этой фразы. Повторите, пожалуйста, ещё раз")
+            return True
+        self.speakers[name] = self.last_spk
+        self._save_speakers()
+        self._say(f"Запомнил голос — {name}")
+        log(f"[spk] зарегистрирован голос: {name} (dim={len(self.last_spk)})")
+        return True
 
     def _wake_audio_path(self):
         return os.path.join(tempfile.gettempdir(), "jarvis_wake.wav")
@@ -235,6 +338,7 @@ class JarvisBridge:
             if accepted:
                 r = json.loads(self.rec.Result())
                 text = r.get("text", "").strip()
+                self.last_spk = self._extract_spk(r)
                 if self.wake_detected:
                     # целая фраза распознана — это и есть команда
                     if text and len(text) >= len(cmd_buf):
@@ -269,6 +373,7 @@ class JarvisBridge:
     def _finalize_text(self) -> str:
         try:
             r = json.loads(self.rec.FinalResult())
+            self.last_spk = self._extract_spk(r)
             return r.get("text", "").strip()
         except Exception:
             return ""
@@ -295,6 +400,13 @@ class JarvisBridge:
         t = re.sub(r"\s+", " ", t).strip(" .,;:-")
         if not t:
             return
+        if self.spk is not None:
+            who = self.identify_speaker()
+            if who:
+                log(f"[spk] говорит: {who}")
+                self._say(f"Говорит, {who}")
+            else:
+                log("[spk] говорящий не распознан")
         if any(k in t for k in ("стоп", "хватит", "замолчи", "выйди", "спать")):
             self._say("Отключаюсь, мастер")
             return
@@ -308,6 +420,10 @@ class JarvisBridge:
         t = text.lower().strip()
         t_clean = re.sub(r"[^\w\s\-+*/.%]", " ", t)
         t_clean = re.sub(r"\s+", " ", t_clean).strip()
+
+        # Регистрация голоса: «запомни голос как Алёна» / «это Алёна» / «меня зовут Алёна»
+        if ("голос" in t or "зовут" in t) and any(k in t for k in ("запомни", "это", "меня")):
+            return self._register_voice(text)
 
         if any(k in t for k in ("который час", "сколько времени", "который сейчас час",
                                 "какое время", "сколько время")):
@@ -1021,13 +1137,33 @@ class JarvisBridge:
             self._say("Не смог отправить команду в мультитул")
 
     def _start_avatar(self):
-        avatar_script = os.path.join(ASSET_DIR, "jarvis_avatar.py")
-        if os.path.exists(avatar_script):
-            subprocess.Popen(
-                [sys.executable, avatar_script],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            log("[avatar] оболочка запущена")
+        # Оболочка запускается В ТОМ ЖЕ процессе (фоновые потоки HTTP-сервера),
+        # чтобы работать и из исходников, и из собранного exe. В frozen-режиме
+        # sys.executable == Jarvis.exe, и запуск подпроцессом невозможен.
+        try:
+            import jarvis_avatar as av
+            av.BASE = ASSET_DIR
+            av.STATE_FILE = STATE_FILE
+            port = av.start_server()
+            html_file = "jarvis_avatar_3d.html"
+            if not os.path.exists(os.path.join(av.BASE, html_file)) or \
+               not os.path.exists(os.path.join(av.BASE, "three147.min.js")) or \
+               not os.path.exists(os.path.join(av.BASE, "robot.glb")):
+                html_file = "jarvis_avatar.html"
+            url = f"http://127.0.0.1:{port}/{html_file}?t={int(time.time())}"
+            edge = av.find_edge()
+            if edge:
+                subprocess.Popen(
+                    [edge, f"--app={url}", "--window-size=300,540", "--new-window"],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            import webbrowser
+            webbrowser.open(url)
+            self._avatar_port = port
+            self._avatar_html = html_file
+            log(f"[avatar] оболочка запущена ({html_file}, порт {port})")
+        except Exception as e:
+            log(f"[avatar] error: {e}")
 
     def _activate_window(self, win):
         try:
