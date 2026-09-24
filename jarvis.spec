@@ -23,6 +23,7 @@ a = Analysis(
     binaries=vosk_binaries,
     datas=vosk_datas + [
         (str(BASE / "jarvis_avatar.py"), "."),
+        (str(BASE / "dim.ps1"), "."),
         (str(BASE / "jarvis_avatar_3d.html"), "."),
         (str(BASE / "three147.min.js"), "."),
         (str(BASE / "GLTFLoader147.js"), "."),

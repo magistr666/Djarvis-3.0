@@ -270,22 +270,49 @@ class JarvisBridge:
     def audio_callback(self, indata, frames, t, status):
         self.audio_q.put(indata.copy())
 
+    def _drain_audio_q(self):
+        while True:
+            try:
+                self.audio_q.get_nowait()
+            except queue.Empty:
+                break
+
     def run_capture(self, stop_event):
         def cb(indata, frames, t, status):
             self.audio_q.put(indata.copy())
-        try:
-            with sd.InputStream(
-                samplerate=SR,
-                blocksize=BLOCK,
-                device=self.capture_dev or None,
-                channels=1,
-                dtype="int16",
-                callback=cb,
-            ):
-                while not stop_event.is_set():
+        last_err = None
+        while not stop_event.is_set():
+            try:
+                with sd.InputStream(
+                    samplerate=SR,
+                    blocksize=BLOCK,
+                    device=self.capture_dev or None,
+                    channels=1,
+                    dtype="int16",
+                    callback=cb,
+                ):
+                    last_err = None
+                    while not stop_event.is_set():
+                        time.sleep(0.1)
+            except Exception as e:
+                if str(e) != str(last_err):
+                    log(f"[capture] ошибка потока: {e}; переподключение через 2 с")
+                    last_err = e
+                # Устройство могло исчезнуть при гашении экрана (аудио-стек уснул).
+                # Сбрасываем на системный дефолт и ждём его появления.
+                self.capture_dev = None
+                self._drain_audio_q()
+                try:
+                    self.rec.Reset()
+                except Exception:
+                    pass
+                for _ in range(20):
+                    if stop_event.is_set():
+                        break
                     time.sleep(0.1)
-        except Exception as e:
-            log(f"[capture] error: {e}")
+            else:
+                # поток завершился штатно (стоп) — выходим
+                break
 
     ECHO_PHRASES = ("слушаю мастер", "слушаю", "мастер", "слушаю мастера",
                 "слушаю мой мастер", "джарвис слушаю", "готов к работе",
@@ -705,18 +732,67 @@ class JarvisBridge:
         subprocess.Popen(["shutdown", "/s", "/t", "5", "/c", "Отключаюсь по команде Джарвиса"],
                          creationflags=subprocess.CREATE_NO_WINDOW)
 
-    def _screen_on(self):
-        self._say("Включаю экран")
-        log("[skill] screen on")
+    def _avatar_hwnd(self):
+        try:
+            for w in gw.getAllWindows():
+                if w.visible and w.title and "Jarvis Avatar" in (w.title or ""):
+                    return int(w._hWnd)
+        except Exception:
+            pass
+        return None
+
+    def _close_dim_window(self):
+        """Закрывает дим-накладку (окно JARVIS_DIM) по заголовку."""
         import ctypes
-        ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, -1)
-        ctypes.windll.user32.mouse_event(1, 0, 0, 0, 0)
+        DIM_TITLE = "JARVIS_DIM"
+        user32 = ctypes.windll.user32
+        result = []
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def cb(hwnd, lparam):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buf, 256)
+            if buf.value == DIM_TITLE:
+                result.append(int(hwnd))
+            return True
+        user32.EnumWindows(EnumProc(cb), 0)
+        for hwnd in result:
+            try:
+                user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+            except Exception:
+                pass
+        return bool(result)
+
+    def _dim_screen(self):
+        """Затемняет экран чёрной накладкой (без отключения питания/аудио)."""
+        self._say("Экран затемнён")
+        log("[skill] screen dim")
+        self._close_dim_window()  # убрать возможные дубли
+        dim_script = os.path.join(ASSET_DIR, "dim.ps1")
+        if os.path.exists(dim_script):
+            subprocess.Popen(
+                ["powershell", "-STA", "-ExecutionPolicy", "Bypass",
+                 "-WindowStyle", "Hidden", "-File", dim_script],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            log("[skill] dim.ps1 не найден")
+
+    def _undim_screen(self):
+        """Откат затемнения: закрывает дим-накладку."""
+        self._say("Экран включён")
+        log("[skill] screen undim")
+        self._close_dim_window()
+        import ctypes
+        try:
+            ctypes.windll.user32.mouse_event(1, 0, 0, 0, 0)
+        except Exception:
+            pass
+
+    def _screen_on(self):
+        self._undim_screen()
 
     def _screen_off(self):
-        self._say("Отключаю экран")
-        log("[skill] screen off")
-        import ctypes
-        ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, 1)
+        self._dim_screen()
 
     def _restart(self):
         self._say("Перезагружаю компьютер")
@@ -1272,6 +1348,14 @@ class JarvisBridge:
         self._say("Джарвис запущен. Готов к работе, мастер")
 
     def run(self):
+        # Не даём системе уйти в сон, пока работает Джарвис.
+        # ES_CONTINUOUS(0x80000000) | ES_SYSTEM_REQUIRED(0x1)
+        # (без ES_AWAYMODE_REQUIRED — тот не давал экрану гаснуть)
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
+        except Exception:
+            pass
         self.loop = asyncio.new_event_loop()
         t_loop = threading.Thread(target=self._loop_thread, daemon=True)
         t_loop.start()
