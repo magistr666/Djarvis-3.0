@@ -1151,19 +1151,47 @@ class JarvisBridge:
                not os.path.exists(os.path.join(av.BASE, "robot.glb")):
                 html_file = "jarvis_avatar.html"
             url = f"http://127.0.0.1:{port}/{html_file}?t={int(time.time())}"
+            # Закрываем старые окна оболочки, чтобы не копились дубликаты
+            self._close_previous_avatars()
             edge = av.find_edge()
             if edge:
                 subprocess.Popen(
                     [edge, f"--app={url}", "--window-size=300,540", "--new-window"],
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
-            import webbrowser
-            webbrowser.open(url)
+            else:
+                # Браузер — только как запасной вариант, если Edge недоступен
+                import webbrowser
+                webbrowser.open(url)
             self._avatar_port = port
             self._avatar_html = html_file
             log(f"[avatar] оболочка запущена ({html_file}, порт {port})")
         except Exception as e:
             log(f"[avatar] error: {e}")
+
+    def _close_previous_avatars(self):
+        """Закрывает ранее открытые окна-оболочки, чтобы не было дубликатов."""
+        import ctypes
+        try:
+            user32 = ctypes.windll.user32
+            found = [w for w in gw.getAllWindows()
+                     if w.visible and "Jarvis Avatar" in (w.title or "")]
+            for w in found:
+                try:
+                    user32.PostMessageW(int(w._hWnd), 0x0010, 0, 0)  # WM_CLOSE
+                except Exception:
+                    pass
+            time.sleep(0.4)
+            for w in found:
+                try:
+                    if hasattr(w, "close"):
+                        w.close()
+                except Exception:
+                    pass
+            if found:
+                log(f"[avatar] закрыто старых окон оболочки: {len(found)}")
+        except Exception as e:
+            log(f"[avatar] close previous error: {e}")
 
     def _activate_window(self, win):
         try:
