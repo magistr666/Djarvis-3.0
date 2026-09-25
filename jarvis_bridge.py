@@ -135,6 +135,7 @@ class JarvisBridge:
         self.wake_lock_until = 0.0
         self.capture_dev = None
         self.last_spk = None          # эмбеддинг голоса последней фразы
+        self.last_topic = ""          # последняя упомянутая тема (для «про это подробнее»)
         self.speakers = self._load_speakers()
 
     # ---------- распознавание говорящего ----------
@@ -349,7 +350,11 @@ class JarvisBridge:
                         self.wake_detected = False
                 continue
             if self.speaking_lock or time.time() < self.wake_lock_until:
+                # Во время озвучки микрофон замолчен. Сливаем накопленные
+                # фреймы, чтобы после длинной фразы (новости) не выплеснуть
+                # старый звук в распознаватель и не «утопить» wake-слово.
                 buf = b""
+                self._drain_audio_q()
                 continue
             # VAD: считаем RMS энергии фрагмента
             arr = np.frombuffer(data.tobytes(), dtype=np.int16).astype(np.float32)
@@ -525,6 +530,14 @@ class JarvisBridge:
             if self._weather(text):
                 return True
 
+        if any(k in t for k in ("новости", "новостей", "что нового в мире",
+                                "свежие новости", "расскажи новости")):
+            self._tell_news()
+            return True
+
+        if any(k in t for k in ("подробнее", "подробней")):
+            return self._tell_more(text)
+
         if any(k in t for k in ("мои документы", "мой компьютер", "этот компьютер",
                                 "мои компьютеры", "загрузки", "скачанные",
                                 "рабочий стол", "корзину", "корзина",
@@ -556,8 +569,12 @@ class JarvisBridge:
                 return True
 
         if any(k in t for k in ("кто ты", "что ты умеешь", "твои возможности", "что ты можешь")):
-            self._say("Я голосовой помощник Джарвис. Умею называть время и дату, открывать браузер и программы, записывать заметки и считать. Остальное передаю в мозг — мультитул")
+            self._say("Я голосовой помощник Джарвис. Умею называть время и дату, новости и погоду, открывать браузер, сайты и программы, записывать заметки и считать. Остальное передаю в мозг — мультитул")
             return True
+
+        # «про <тема>» без слова «подробнее» — тоже детализация по теме
+        if re.match(r"про\s+\S", t):
+            return self._tell_more(text)
 
         return False
 
@@ -1105,6 +1122,102 @@ class JarvisBridge:
             log(f'[weather] error: {e}')
             self._say(f'Ошибка при получении погоды: {e}')
             return False
+
+    def _tell_news(self):
+        # Сразу отвечаем, чтобы не было длинной тишины во время загрузки
+        self._say("Сейчас, получаю последние новости")
+        def _fetch():
+            feeds = [
+                "https://lenta.ru/rss/news",
+                "https://www.interfax.ru/rss.asp",
+                "https://ria.ru/export/rss2/archive/index.xml",
+                "https://tass.ru/rss/v2.xml",
+            ]
+            import urllib.request
+            import xml.etree.ElementTree as ET
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            for url in feeds:
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        data = r.read()
+                    root = ET.fromstring(data)
+                    titles = []
+                    for item in root.iter("item"):
+                        t = item.findtext("title")
+                        if t and t.strip():
+                            t = t.strip()
+                            if t not in titles:
+                                titles.append(t)
+                        if len(titles) >= 6:
+                            break
+                    if titles:
+                        spoken = titles[:5]
+                        self.last_topic = spoken[-1]
+                        msg = "Последние новости. " + " Далее. ".join(spoken)
+                        log(f"[news] заголовков: {len(titles)} из {url}")
+                        self._say(msg)
+                        return
+                except Exception as e:
+                    log(f"[news] источник {url} не сработал: {e}")
+            self._say("Не удалось загрузить новости")
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _tell_more(self, text: str) -> bool:
+        t = text.lower()
+        topic = self.last_topic or ""
+        # «про это / об этом подробнее» → используем последнюю тему
+        # «про <тема> подробнее» → берем слова после «про»
+        m = re.search(r"про\s+(.+?)(?:\s+подробн\w+|\.|$)", text, flags=re.I)
+        if m:
+            cand = m.group(1).strip(" .,;:«»\"'")
+            cand = re.sub(r"(подробнее|подробней|расскажи|рассказать|нам|найди|о том|что нибудь)",
+                          "", cand, flags=re.I).strip(" .,;:«»\"'")
+            if cand and cand.lower() not in (
+                "это", "этом", "об этом", "о нем", "о нём", "нем", "нём", "про",
+                "такая", "такой", "такое", "такие", "эта", "этот", "эти",
+                "там", "тут", "вот", "что", "что-то", "нить", "одна"):
+                topic = cand
+        if topic:
+            self._tell_more_fetch(topic)
+            return True
+        self._say("Про что подробнее? Скажите, например: про это подробнее")
+        return True
+
+    def _tell_more_fetch(self, topic: str):
+        def _run():
+            import urllib.request
+            import urllib.parse
+            import json
+            self._say(f"Про {topic}. Сейчас поищу")
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            q = urllib.parse.quote(topic)
+            url = ("https://ru.wikipedia.org/w/api.php?action=query&format=json"
+                   "&prop=extracts&exintro=1&explaintext=1&redirects=1"
+                   f"&titles={q}")
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                pages = data.get("query", {}).get("pages", {}) or {}
+                extract = ""
+                for pg in pages.values():
+                    if pg.get("extract"):
+                        extract = pg["extract"]
+                        break
+                if not extract:
+                    self._say(f"Не нашёл подробностей про {topic}")
+                    return
+                extract = re.sub(r"\s+", " ", extract).strip()
+                sentences = re.split(r"(?<=[.!?])\s+", extract)
+                brief = " ".join(sentences[:2]).strip()
+                if len(brief) > 420:
+                    brief = brief[:417].rstrip() + "..."
+                self._say(brief)
+            except Exception as e:
+                log(f"[more] error: {e}")
+                self._say(f"Не получилось найти информацию про {topic}")
+        threading.Thread(target=_run, daemon=True).start()
 
     def _safe_calc(self, expr: str) -> bool:
         import ast
