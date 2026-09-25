@@ -471,16 +471,6 @@ class JarvisBridge:
             self._say(f"Сегодня {now.day} {months[now.month]} {now.year} года")
             return True
 
-        if "браузер" in t and any(k in t for k in ("открой", "запусти", "включи", "откройте")):
-            self._open_browser()
-            return True
-
-        if "сайт" in t or "открой ютуб" in t or "открой ютьюб" in t or any(k in t for k in self.SITE_ALIASES):
-            site = self._extract_site(text)
-            if site:
-                self._open_site(site)
-                return True
-
         if any(k in t for k in ("включи экран", "включи монитор", "разбуди экран",
                                 "проснись экран", "включи подсветку")):
             self._screen_on()
@@ -491,6 +481,16 @@ class JarvisBridge:
                                 "потуши экран")):
             self._screen_off()
             return True
+
+        if "браузер" in t and any(k in t for k in ("открой", "запусти", "включи", "откройте")):
+            self._open_browser()
+            return True
+
+        if "сайт" in t or "открой ютуб" in t or "открой ютьюб" in t or self._site_alias_url(t):
+            site = self._extract_site(text)
+            if site:
+                self._open_site(site)
+                return True
 
         if any(k in t for k in ("выключи компьютер", "выключи комп", "выключить компьютер",
                                 "выключи пк", "отключи компьютер")):
@@ -705,14 +705,22 @@ class JarvisBridge:
 
     def _extract_site(self, text: str) -> str:
         t = text.lower()
-        for alias, url in self.SITE_ALIASES.items():
-            if alias in t:
-                return url
+        url = self._site_alias_url(t)
+        if url:
+            return url
         match = re.search(r"(?:сайт|открой|открывай)\s+(\S+)", t)
         if match:
             return match.group(1).replace("точка", ".").replace("ком", ".com") \
                 .replace("ру", ".ru") \
                 .replace(" ", "")
+        return ""
+
+    def _site_alias_url(self, t: str) -> str:
+        """Возвращает URL сайта по алиасу, но только как целому слову
+        (границы слова) — чтобы «вк» не срабатывало внутри «включи»."""
+        for alias, url in self.SITE_ALIASES.items():
+            if re.search(r"(^|[\s.,;:!?])" + re.escape(alias) + r"($|[\s.,;:!?])", t):
+                return url
         return ""
 
     def _open_site(self, site: str):
@@ -1348,6 +1356,15 @@ class JarvisBridge:
         self._say("Джарвис запущен. Готов к работе, мастер")
 
     def run(self):
+        # Единственный экземпляр: если Джарвис уже запущен — выходим,
+        # чтобы автозагрузка и ручной запуск не плодили дубли.
+        try:
+            import ctypes
+            if not self._acquire_single_instance():
+                log("Экземпляр Jarvis уже запущен — выход")
+                return
+        except Exception:
+            pass
         # Не даём системе уйти в сон, пока работает Джарвис.
         # ES_CONTINUOUS(0x80000000) | ES_SYSTEM_REQUIRED(0x1)
         # (без ES_AWAYMODE_REQUIRED — тот не давал экрану гаснуть)
@@ -1374,6 +1391,19 @@ class JarvisBridge:
             log("Завершаю работу...")
         finally:
             stop.set()
+
+    def _acquire_single_instance(self) -> bool:
+        """Именованный мьютекс: True если экземпляр уникален, False если уже запущен."""
+        import ctypes
+        try:
+            ERROR_ALREADY_EXISTS = 183
+            self._instance_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "JarvisBridge_SingleInstance")
+            err = ctypes.windll.kernel32.GetLastError()
+            if self._instance_mutex and err == ERROR_ALREADY_EXISTS:
+                return False
+            return bool(self._instance_mutex)
+        except Exception:
+            return True
 
     def _loop_thread(self):
         asyncio.set_event_loop(self.loop)
