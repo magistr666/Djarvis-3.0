@@ -136,6 +136,7 @@ class JarvisBridge:
         self.capture_dev = None
         self.last_spk = None          # эмбеддинг голоса последней фразы
         self.last_topic = ""          # последняя упомянутая тема (для «про это подробнее»)
+        self._lock_since = 0.0        # когда взведён speaking_lock (для watchdog)
         self.speakers = self._load_speakers()
 
     # ---------- распознавание говорящего ----------
@@ -1290,7 +1291,7 @@ class JarvisBridge:
                 for attempt in range(3):
                     try:
                         comm = edge_tts.Communicate(text, VOICE)
-                        await comm.save(tmp)
+                        await asyncio.wait_for(comm.save(tmp), timeout=40)
                         last_err = None
                         break
                     except Exception as e:
@@ -1299,7 +1300,8 @@ class JarvisBridge:
                 if last_err:
                     log(f"[tts] gen error (3 попытки): {last_err}")
                     return
-                await asyncio.to_thread(self._play_mp3_blocking, tmp)
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._play_mp3_blocking, tmp), timeout=180)
                 await asyncio.sleep(0.6)
             except Exception as e:
                 log(f"[tts] error: {e}")
@@ -1493,6 +1495,7 @@ class JarvisBridge:
         cap = threading.Thread(target=self.run_capture, args=(stop,), daemon=True)
         cap.start()
         set_state("idle")
+        threading.Thread(target=self._watchdog, daemon=True).start()
         self._start_avatar()
         log("Jarvis готов. Скажите «Джарвис»...")
         log("Для выхода: Ctrl+C или скажите «Джарвис, стоп».")
@@ -1521,6 +1524,26 @@ class JarvisBridge:
     def _loop_thread(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
+
+    def _watchdog(self):
+        """Сбрасывает зависший speaking_lock, который глушит микрофон."""
+        while True:
+            if self.speaking_lock:
+                if not self._lock_since:
+                    self._lock_since = time.time()
+                if time.time() - self._lock_since > 60:
+                    log("[watchdog] сброс зависшего speaking_lock")
+                    self.speaking_lock = False
+                    self._lock_since = 0.0
+                    try:
+                        self.rec.Reset()
+                    except Exception:
+                        pass
+                    self._drain_audio_q()
+                    set_state("idle")
+            else:
+                self._lock_since = 0.0
+            time.sleep(5)
 
 
 if __name__ == "__main__":
